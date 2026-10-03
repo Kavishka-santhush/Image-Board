@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Env files — never commit real credentials (RDS password, AWS keys!)
+.env
+.env.local
+.env.production
+
+# Build output (built in CI, deployed as artifacts)
+dist/
+build/
+
+# Lambda packaging
+lambda/**/*.zip
+
+# Logs / misc
+*.log
+.DS_Store

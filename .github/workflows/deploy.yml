@@ -1,0 +1,189 @@
+# =====================================================================
+# THE CI/CD PIPELINE — everything before this file was prep for this.
+#
+# TRIGGER: any push to main (docs-only pushes are skipped — why burn
+# a deploy when only markdown changed? "paths-ignore" = cheap smart CI)
+#
+# GRAPH:
+#   check-backend ─┐
+#                  ├──> deploy-ec2  (SSH: upload → npm ci → MIGRATE →
+#   build-frontend ┘                 pm2 reload → static swap → nginx
+#                                    reload → HEALTH GATE)
+#
+# THE DEPLOY-ORDER LESSON (why migrate BEFORE reload):
+# new code expects new schema. Files → migrate → restart = shortest
+# window of version mismatch. Zero-downtime teams use expand/contract
+# migrations (add columns first deploy, use them next); our single
+# instance has a ~2s gap — acceptable, but know the difference.
+#
+# WHY migrations run ON EC2, not in the runner:
+# GitHub's runner IPs are a huge rotating cloud — allowlisting them in
+# the RDS security group means 0.0.0.0/0 (never!). The EC2 instance has
+# a STABLE identity (its security group) that RDS already trusts.
+# Same DB, better vantage point. This trade-off IS the lesson.
+# =====================================================================
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch: {} # manual button, for re-runs while learning
+
+# one deploy at a time: a second push mid-deploy could interleave
+# file copies — queue instead of corrupt
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------------
+  # CI STAGE 1 — backend "tests"
+  # Syntax-gate every file: node --check parses without executing, so
+  # we catch typos/unclosed braces in seconds WITHOUT needing RDS.
+  # (Real unit tests come naturally once you outgrow this — the job
+  # shape won't change.)
+  # ------------------------------------------------------------------
+  check-backend:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install (from lockfile — reproducible, no surprises)
+        run: npm ci
+        working-directory: backend
+
+      - name: Syntax gate (parse every .js)
+        run: |
+          find src migrations seeds knexfile.js -name '*.js' -print0 \
+            | xargs -0 -n1 node --check
+        working-directory: backend
+
+  # ------------------------------------------------------------------
+  # CI STAGE 2 — frontend build
+  # THE t2.micro lifesaver: vite build + esbuild can peak 500MB+ RAM —
+  # on a 1GB box (with OS + Node + pm2 resident) that's an OOM party.
+  # The free GitHub runner does the heavy lifting; EC2 only ever
+  # receives finished static files. "build once, deploy the artifact"
+  # is a core CI/CD principle — the server never compiles anything.
+  # ------------------------------------------------------------------
+  build-frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+        working-directory: frontend
+
+      - run: npm run build
+        working-directory: frontend
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # CD STAGE — SSH deploy to EC2
+  # Secrets (Settings → Secrets and variables → Actions):
+  #   EC2_HOST  = instance public DNS or Elastic IP
+  #   EC2_USER  = ec2-user
+  #   EC2_SSH_KEY = PRIVATE key of the deploy keypair (docs § 6)
+  # ------------------------------------------------------------------
+  deploy-ec2:
+    name: Deploy to EC2 (+ RDS migrate)
+    runs-on: ubuntu-latest
+    needs: [check-backend, build-frontend]
+    steps:
+      - uses: actions/checkout@v4 # for deploy/ configs + backend sources
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist
+
+      # Upload layout (rsync semantics, preserves relative paths):
+      #   /var/app/image-board/backend/...      source + configs
+      #   /var/app/image-board/deploy/...       nginx + pm2 + bootstrap
+      #   /var/app/image-board/frontend-dist/   static files
+      # node_modules deliberately NOT uploaded — installed on the box
+      # (native module binaries differ per platform; and lockfile +
+      # npm ci gives an identical, audited tree there).
+      - name: Upload release files
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          rm_latest: true
+          source: 'backend,deploy,frontend-dist'
+          target: /var/app/image-board
+
+      - name: Deploy on the instance
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true # bash set -e behaviour: first failure fails the job
+          script: |
+            set -e
+            cd /var/app/image-board
+
+            echo "==> Backend deps (prod only, from lockfile)"
+            cd backend
+            npm ci --omit=dev
+            # .env must exist (docs § 6). Fail loudly here, not in pm2 logs:
+            test -f .env || { echo "MISSING /var/app/image-board/backend/.env"; exit 1; }
+
+            echo "==> Database migrations (RDS — BEFORE code restart)"
+            npx knex migrate:latest --env production
+
+            echo "==> Restart API (pm2)"
+            if pm2 describe image-board-backend >/dev/null 2>&1; then
+              pm2 reload image-board-backend --update-env --env production
+            else
+              pm2 start /var/app/image-board/deploy/ecosystem.config.js --env production
+            fi
+            pm2 save
+
+            echo "==> Static site swap (rsync --delete = exact mirror)"
+            rsync -a --delete /var/app/image-board/frontend-dist/ /var/www/image-board/
+
+            echo "==> Nginx configs from git (GitOps) + validate + reload"
+            sudo cp /var/app/image-board/deploy/nginx/nginx.conf /etc/nginx/nginx.conf
+            sudo cp /var/app/image-board/deploy/nginx/image-board.conf /etc/nginx/conf.d/image-board.conf
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            echo "==> HEALTH GATE — full chain: nginx -> pm2 node -> RDS"
+            sleep 3
+            # curl -f fails the job on 5xx: if the app or RDS is down,
+            # the deploy shows RED on GitHub. Failing visible > failing silent.
+            curl -fsS http://localhost/api/health
+            echo ""
+            echo "✅ Deployed and healthy."
+
+  # ------------------------------------------------------------------
+  # Lambda publishes live in a SIBLING workflow (deploy-lambda.yml):
+  # path-based triggering is cleaner as its own file's `on.paths` than
+  # as an `if:` condition re-implementing change detection here.
+  # ------------------------------------------------------------------

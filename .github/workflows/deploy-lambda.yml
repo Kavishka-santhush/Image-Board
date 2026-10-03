@@ -1,0 +1,85 @@
+# =====================================================================
+# LAMBDA CD — thumbnailer publish, Step 8's manual create-function
+# automated. Two CI/CD lessons this file teaches:
+#
+# 1) PATH-FILTERED TRIGGERS: this workflow ONLY runs when the lambda
+#    (or this file itself) changes. Editing the README shouldn't
+#    republish serverless code. Cheap, focused pipelines = the
+#    difference between CI you trust and CI you ignore.
+#
+# 2) KEYLESS AWS AUTH VIA OIDC: no AWS_ACCESS_KEY_ID stored anywhere.
+#    GitHub's runner gets a short-lived OIDC token → trades it at AWS
+#    STS for credentials scoped to ONE role that can ONLY update ONE
+#    function. Compare with the old way (IAM user keys sitting in
+#    GitHub secrets for years, each one a full-account breach if
+#    leaked). Setup: docs/aws-setup.md § 7.
+# =====================================================================
+name: Deploy Lambda
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'lambda/**'
+      - '.github/workflows/deploy-lambda.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-lambda
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & update thumbnailer
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # THE OIDC grant — mints the JWT that AWS trusts
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: lambda/thumbnailer/package-lock.json
+
+      - name: Install linux deps
+        # On the Linux runner the Step 8 cross-install flags are
+        # unnecessary — this IS linux x64. (The flags were a Windows
+        # dev-machine workaround; CI is the native habitat. Notice how
+        # pipelines naturally dissolve local gotchas.)
+        run: npm ci
+        working-directory: lambda/thumbnailer
+
+      - name: Package deployment zip
+        run: zip -qr function.zip index.js package.json node_modules
+        working-directory: lambda/thumbnailer
+
+      - name: Configure AWS credentials (OIDC — no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_LAMBDA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+      - name: Update function code
+        run: |
+          aws lambda update-function-code \
+            --function-name image-board-thumbnailer \
+            --zip-file fileb://function.zip
+
+      - name: Wait for AWS to accept the new code
+        # update-function-code returns BEFORE propagation finishes —
+        # polling avoids "updated but still running old code" races.
+        run: aws lambda wait function-updated-v2 \
+          --function-name image-board-thumbnailer
+
+      - name: Publish an immutable version
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name image-board-thumbnailer \
+            --query Version --output text)
+          echo "Published v$VERSION — pin the S3 trigger to a version/alias"
+          # Lesson: $LATEST is mutable and not versionable — production
+          # triggers should point at a published version or an alias you
+          # can roll back instantly (docs § 7 note).

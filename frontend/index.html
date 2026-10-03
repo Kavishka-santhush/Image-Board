@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      WHY the title mentions production: after deploy, this same
+      index.html is served by Nginx on EC2 — you'll see it in the
+      browser tab and know the pipeline worked. Small thing, big
+      feedback loop in CI/CD learning.
+    -->
+    <title>Image Board — AWS CI/CD Learning App</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
